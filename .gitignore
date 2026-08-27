@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model/cache
+.cache/
+huggingface/
+*.bin
+*.safetensors
+
+# Large/raw datasets
+data/raw/*
+!data/raw/.gitkeep
+
+# Generated results
+results/raw/*
+!results/raw/.gitkeep
+
+# Temporary files
+*.log
+*.tmp

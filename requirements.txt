@@ -1,0 +1,11 @@
+torch
+transformers
+accelerate
+pandas
+numpy
+networkx
+scikit-learn
+scipy
+statsmodels
+matplotlib
+tqdm
