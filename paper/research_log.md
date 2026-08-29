@@ -287,5 +287,51 @@ semantic-clean evidence packets.
 
 
 
+## Entity-label anonymization
+
+Status: Complete
+
+A deterministic per-QID anonymization mapping was constructed from the
+union of entities appearing across the clean and all feasible corrupted
+conditions for the same question.
+
+This guarantees that the same natural entity receives the same anonymous
+identifier across clean and corrupted variants of a QID.
+
+Entity representation:
+Entity_XXXX
+
+Anonymized:
+- topic entities
+- gold answers
+- evidence head/tail nodes
+- intermediate nodes
+- replacement entities
+- literal KG nodes such as years, languages, and genres
+
+Preserved:
+- relation labels
+- question semantics except the topic entity surface form
+- evidence order
+- evidence size
+- graph structure
+- internal evidence roles
+- corruption structure
+
+Validation:
+- clean: 300 / 300
+- entity substitution: 300 / 300
+- relation substitution: 179 / 179
+- contradiction: 300 / 300
+- intermediate rerouting: 198 / 198
+- total validation failures: 0
+
+Seed: 42
+
+Important:
+Evidence role labels (support/context/contradiction) are internal metadata
+and will not be exposed to the LLM during inference.
+
+
 
 
