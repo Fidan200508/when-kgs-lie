@@ -86,6 +86,41 @@ No obvious schema-invalid relation substitutions were observed.
 
 
 
+## Contradictory insertion
+
+Status: Complete
+
+Successful corruptions: 300/300
+Failures: 0
+
+Hop distribution:
+- 1-hop: 100
+- 2-hop: 100
+- 3-hop: 100
+
+Primary position:
+answer-adjacent
+
+Method:
+The original true support triple was retained.
+A type-compatible false triple with the same relation was inserted.
+To preserve the evidence budget, one non-support context triple was
+deterministically replaced by the contradictory triple.
+
+Evidence size:
+unchanged between clean and contradiction conditions.
+
+Seed:
+42
+
+Validation:
+- true support remains present
+- exactly one context slot is replaced
+- relation remains unchanged
+- contradictory triple is absent from the original KG
+- false replacement is type-compatible
+
+
 
 
 
