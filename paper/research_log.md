@@ -121,6 +121,22 @@ Validation:
 - false replacement is type-compatible
 
 
+## Contradictory insertion manual audit
+
+Manual audit size: 20 randomly sampled examples
+Seed: 42
+
+Result:
+20 inspected examples showed a valid conflict structure:
+the original true support fact was retained and a type-compatible false
+fact using the same relation was introduced.
+
+The evidence budget was preserved by replacing one non-support context
+triple with the contradictory triple.
+
+No obvious type-invalid contradictory fact was observed.
+
+
 
 
 
