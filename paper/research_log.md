@@ -239,5 +239,53 @@ Target-relation inference coverage on full MetaQA test split:
 Only semantically valid questions were eligible for the 100-per-hop pilot.
 
 
+## Final corruption datasets
+
+All corruption conditions were regenerated after freezing the
+semantically validated clean pilot.
+
+Clean:
+300 items
+- 1-hop: 100
+- 2-hop: 100
+- 3-hop: 100
+
+Entity substitution:
+300 / 300
+- 1-hop: 100
+- 2-hop: 100
+- 3-hop: 100
+
+Relation substitution:
+179 / 300 feasible
+- 1-hop: 74
+- 2-hop: 60
+- 3-hop: 45
+
+Infeasible relation substitutions:
+- no eligible support relation: 112
+- no valid false replacement relation: 9
+
+Contradictory insertion:
+300 / 300
+- 1-hop: 100
+- 2-hop: 100
+- 3-hop: 100
+
+Intermediate-node rerouting:
+198 / 300
+- 1-hop: 0
+- 2-hop: 100
+- 3-hop: 98
+
+Rerouting feasibility among multi-hop examples:
+198 / 200 = 99%
+
+All corruptions use seed 42 and were generated from the frozen
+semantic-clean evidence packets.
+
+
+
+
 
 
