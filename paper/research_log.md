@@ -139,5 +139,105 @@ No obvious type-invalid contradictory fact was observed.
 
 
 
+## Intermediate-node rerouting
+
+Status: Complete
+
+Successful reroutings: 198 / 300
+Failures: 102
+
+Successful hop distribution:
+- 1-hop: 0
+- 2-hop: 100
+- 3-hop: 98
+
+Failure reasons:
+- no_intermediate_node: 100
+- no_valid_distinct_edge_target: 2
+
+Feasibility among multi-hop examples:
+198 / 200 = 99%
+
+Method:
+For a multi-hop support path A -> B -> C, the intermediate node B was
+replaced with a structurally compatible node B', producing A -> B' -> C.
+
+Both adjacent support triples were changed while preserving their relation
+labels. Replacement nodes were restricted to entities observed in the same
+structural relation slots.
+
+Both newly generated triples were required to be absent from the original KG.
+
+Evidence size and evidence order were preserved.
+
+Seed:
+42
+
+
+
+## Semantic support-path audit
+
+During manual inspection of rerouting examples, several clean canonical
+support paths were found to reach the correct answer through semantically
+misaligned KG walks.
+
+Examples included paths using written_by where the question required
+directed_by, and repeated release_year relations where the question required
+a shared-director chain.
+
+Cause:
+Exact-hop KG walks were ranked with a soft semantic score, which did not
+strictly enforce the relation pattern implied by the question.
+
+Decision:
+Model inference was paused. Clean evidence selection will be corrected to
+prefer/require question-consistent relation signatures before regenerating
+all corruption conditions.
+
+
+
+
+## Final semantic-clean MetaQA pilot
+
+Status: Frozen
+
+Pilot size: 300
+- 1-hop: 100
+- 2-hop: 100
+- 3-hop: 100
+
+Seed: 42
+Context triples per item: 5
+
+KG:
+- triples: 134,741
+- entities in bidirectional adjacency: 43,234
+
+Support-path construction:
+- exact-hop KG walks
+- node repetition permitted where required by MetaQA
+- exact question-derived relation profile required
+- final support relation constrained to the inferred answer relation
+- one deterministic canonical path selected per gold answer
+
+Validation:
+- semantic violations: 0
+- competing clean-context answer violations: 0
+- context shortages: 0
+- pilot size check: PASS
+- semantic constraint check: PASS
+- clean answer-conflict check: PASS
+- fixed context check: PASS
+
+Average support triples: 10.72
+
+Target-relation inference coverage on full MetaQA test split:
+- 1-hop: 72.99%
+- 2-hop: 100.00%
+- 3-hop: 100.00%
+
+Only semantically valid questions were eligible for the 100-per-hop pilot.
+
+
 
 

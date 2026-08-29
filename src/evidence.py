@@ -1,5 +1,5 @@
-from collections import defaultdict, deque
 from pathlib import Path
+from collections import defaultdict, Counter
 import hashlib
 import json
 import random
@@ -12,1357 +12,46 @@ from data import load_kb, load_questions
 # CONFIG
 # ============================================================
 
-PROCESSED_DIR = Path("data/processed")
+OUTPUT_PATH = Path(
+    "data/processed/metaqa_pilot_clean.jsonl"
+)
+
+REJECTION_PATH = Path(
+    "results/raw/clean_semantic_rejections.jsonl"
+)
+
+TARGET_AUDIT_PATH = Path(
+    "results/raw/target_relation_audit.jsonl"
+)
 
 DEFAULT_SEED = 42
-DEFAULT_CONTEXT_SIZE = 5
+TARGET_PER_HOP = 100
+CONTEXT_SIZE = 5
+MAX_PATHS = 500
 
 
 # ============================================================
-# 1. BUILD BIDIRECTIONAL KG INDEX
+# 1. REPRODUCIBLE SEED
 # ============================================================
 
-def build_adjacency(triples):
-    """
-    MetaQA KG-ni bidirectional traversal index-ə çevirir.
-
-    Original triple:
-        head | relation | tail
-
-    Traversal zamanı:
-        head -> tail : reverse=False
-        tail -> head : reverse=True
-
-    Vacib:
-    Original KG triple həmişə öz istiqamətində saxlanılır.
-    """
-
-    adjacency = defaultdict(list)
-
-    for triple in triples:
-
-        head = triple["head"]
-        relation = triple["relation"]
-        tail = triple["tail"]
-
-        original_triple = (
-            head,
-            relation,
-            tail,
-        )
-
-        # Forward traversal
-        adjacency[head].append(
-            {
-                "next": tail,
-                "relation": relation,
-                "reverse": False,
-                "triple": original_triple,
-            }
-        )
-
-        # Reverse traversal
-        adjacency[tail].append(
-            {
-                "next": head,
-                "relation": relation,
-                "reverse": True,
-                "triple": original_triple,
-            }
-        )
-
-    return adjacency
-
-
-# ============================================================
-# 2. EXACT-HOP WALK SEARCH
-# ============================================================
-
-def find_exact_hop_paths(
-    adjacency,
-    source,
-    target,
-    num_hops,
-    max_paths=100,
-    allowed_relations=None,
-):
-    """
-    source-dan target-a EXACT num_hops uzunluğunda WALK tapır.
-
-    Əvvəlki versiyada visited-node prevention var idi.
-    Bu bəzi MetaQA 3-hop reasoning chain-lərini bloklayırdı.
-
-    İndi node repetition mümkündür:
-
-        A -> B -> A -> C
-
-    kimi walk valid ola bilər.
-
-    num_hops maksimum 3 olduğu üçün search manageable-dir.
-    """
-
-    if source is None or target is None:
-        return []
-
-    paths_found = []
-
-    # queue item:
-    # (
-    #     current_entity,
-    #     path_so_far
-    # )
-
-    queue = deque(
-        [
-            (
-                source,
-                [],
-            )
-        ]
-    )
-
-    while queue:
-
-        current_entity, current_path = queue.popleft()
-
-        # Exact hop limit-ə çatmışıq
-        if len(current_path) == num_hops:
-
-            if current_entity == target:
-
-                paths_found.append(
-                    current_path
-                )
-
-                if len(paths_found) >= max_paths:
-                    return paths_found
-
-            continue
-
-        # Current entity-dən bütün edges
-        for edge in adjacency.get(
-            current_entity,
-            [],
-        ):
-
-            relation = edge["relation"]
-
-            # Semantic-restricted search verilmişdirsə
-            if (
-                allowed_relations is not None
-                and relation not in allowed_relations
-            ):
-                continue
-
-            next_entity = edge["next"]
-
-            step = {
-                "from_entity": current_entity,
-                "to_entity": next_entity,
-                "relation": relation,
-                "reverse": edge["reverse"],
-                "triple": edge["triple"],
-            }
-
-            queue.append(
-                (
-                    next_entity,
-                    current_path + [step],
-                )
-            )
-
-    return paths_found
-
-
-# ============================================================
-# 3. QUESTION -> RELATION SEMANTICS
-# ============================================================
-
-def get_question_relation_scores(question):
-    """
-    Question text-də hansı MetaQA relation-larının
-    semantik olaraq relevant olduğunu score edir.
-
-    MetaQA yalnız 9 relation istifadə edir.
-    Ona görə lightweight deterministic mapping kifayətdir.
-    """
-
-    q = question.lower()
-
-    scores = {
-        "directed_by": 0,
-        "has_genre": 0,
-        "has_imdb_rating": 0,
-        "has_imdb_votes": 0,
-        "has_tags": 0,
-        "in_language": 0,
-        "release_year": 0,
-        "starred_actors": 0,
-        "written_by": 0,
-    }
-
-    keyword_map = {
-
-        "directed_by": [
-            "directed",
-            "director",
-            "directors",
-        ],
-
-        "written_by": [
-            "wrote",
-            "written",
-            "writer",
-            "writers",
-            "screenwriter",
-            "screenwriters",
-        ],
-
-        "starred_actors": [
-            "starred",
-            "stars in",
-            "star in",
-            "appear in",
-            "appears in",
-            "appeared in",
-            "actor",
-            "actors",
-            "actress",
-            "actresses",
-            "cast",
-        ],
-
-        "in_language": [
-            "language",
-            "languages",
-        ],
-
-        "has_genre": [
-            "genre",
-            "genres",
-        ],
-
-        "release_year": [
-            "release year",
-            "released",
-            "release",
-            "year",
-        ],
-
-        "has_imdb_rating": [
-            "imdb rating",
-            "rating",
-            "ratings",
-        ],
-
-        "has_imdb_votes": [
-            "imdb votes",
-            "votes",
-            "vote",
-        ],
-
-        "has_tags": [
-            "tags",
-            "tag",
-        ],
-    }
-
-    for relation, keywords in keyword_map.items():
-
-        for keyword in keywords:
-
-            if keyword in q:
-                scores[relation] += 1
-
-    return scores
-
-
-# ============================================================
-# 4. INFER FINAL/TARGET RELATION
-# ============================================================
-
-def infer_target_relation(question):
-    """
-    Question-un cavabına aparan FINAL relation-u
-    mümkün olduğu qədər infer edir.
-
-    Bu support-path ranking-i gücləndirir.
-
-    Əgər confidence kifayət deyilsə None qaytarır.
-    """
-
-    q = question.lower().strip()
-
-    # -------------------------------------
-    # Language
-    # -------------------------------------
-
-    if (
-        "which language" in q
-        or "which languages" in q
-        or "what language" in q
-        or "what languages" in q
-        or "in which language" in q
-        or "in which languages" in q
-    ):
-        return "in_language"
-
-    # -------------------------------------
-    # Genre
-    # -------------------------------------
-
-    if (
-        "which genre" in q
-        or "which genres" in q
-        or "what genre" in q
-        or "what genres" in q
-    ):
-        return "has_genre"
-
-    # -------------------------------------
-    # Rating
-    # -------------------------------------
-
-    if "rating" in q:
-        return "has_imdb_rating"
-
-    # -------------------------------------
-    # Votes
-    # -------------------------------------
-
-    if "votes" in q or "how many votes" in q:
-        return "has_imdb_votes"
-
-    # -------------------------------------
-    # Tags
-    # -------------------------------------
-
-    if (
-        "which tags" in q
-        or "what tags" in q
-    ):
-        return "has_tags"
-
-    # -------------------------------------
-    # Release year
-    # -------------------------------------
-
-    if (
-        "what year" in q
-        or "which year" in q
-        or "release year" in q
-        or "when was" in q
-    ):
-        return "release_year"
-
-    # -------------------------------------
-    # Written by
-    # -------------------------------------
-
-    written_patterns = [
-        r"^who wrote\b",
-        r"^which person wrote\b",
-        r"^who are the screenwriters\b",
-        r"^who were the screenwriters\b",
-        r"^which screenwriters\b",
-        r"^which writers\b",
-        r"^who are the writers\b",
-        r"^who is the writer\b",
-        r"^what person wrote\b",
-    ]
-
-    for pattern in written_patterns:
-
-        if re.search(pattern, q):
-            return "written_by"
-
-    # -------------------------------------
-    # Directed by
-    # -------------------------------------
-
-    directed_patterns = [
-        r"^who directed\b",
-        r"^which person directed\b",
-        r"^who are the directors\b",
-        r"^who were the directors\b",
-        r"^which directors\b",
-        r"^who is the director\b",
-        r"^what person directed\b",
-    ]
-
-    for pattern in directed_patterns:
-
-        if re.search(pattern, q):
-            return "directed_by"
-
-    # -------------------------------------
-    # Starred actors / appear in
-    # -------------------------------------
-
-    starred_patterns = [
-        r"^who starred\b",
-        r"^which actors\b",
-        r"^who are the actors\b",
-        r"^who were the actors\b",
-        r"^what films does .+ appear in\b",
-        r"^what movies does .+ appear in\b",
-        r"^which films does .+ appear in\b",
-        r"^which movies does .+ appear in\b",
-        r"^what does .+ appear in\b",
-    ]
-
-    for pattern in starred_patterns:
-
-        if re.search(pattern, q):
-            return "starred_actors"
-
-    return None
-
-
-# ============================================================
-# 5. SCORE CANDIDATE PATH SEMANTICALLY
-# ============================================================
-
-def score_path_semantically(
-    path,
-    relation_scores,
-    target_relation=None,
-):
-    """
-    Candidate support path üçün semantic score.
-
-    Relevant relation-lar score artırır.
-
-    Əgər final edge question-un target relation-u ilə
-    uyğun gəlirsə böyük bonus alır.
-    """
-
-    score = 0.0
-
-    for step in path:
-
-        relation = step["relation"]
-
-        score += relation_scores.get(
-            relation,
-            0,
-        )
-
-    # Final relation xüsusi əhəmiyyətlidir
-    if (
-        target_relation is not None
-        and path
-        and path[-1]["relation"] == target_relation
-    ):
-        score += 5.0
-
-    return score
-
-
-def path_signature(path):
-    """
-    Deterministic tie-break üçün path representation.
-    """
-
-    return tuple(
-        (
-            step["relation"],
-            step["reverse"],
-            step["from_entity"],
-            step["to_entity"],
-        )
-        for step in path
-    )
-
-
-# ============================================================
-# 6. FIND SEMANTICALLY-ALIGNED SUPPORT PATHS
-# ============================================================
-
-def find_support_paths(
-    item,
-    adjacency,
-    max_paths_per_answer=1,
-):
-    """
-    Hər gold answer üçün support path tapır.
-
-    Proses:
-
-        Question
-           ↓
-    relevant relations
-           ↓
-    exact-hop candidate paths
-           ↓
-    semantic scoring
-           ↓
-    best path
-
-    Beləliklə sadəcə "ilk tapılan path" seçilmir.
-    """
-
-    support_paths = {}
-
-    relation_scores = get_question_relation_scores(
-        item["question"]
-    )
-
-    target_relation = infer_target_relation(
-        item["question"]
-    )
-
-    relevant_relations = {
-        relation
-        for relation, score
-        in relation_scores.items()
-        if score > 0
-    }
-
-    for answer in item["gold_answers"]:
-
-        # ====================================================
-        # FIRST TRY:
-        # only semantically relevant relations
-        # ====================================================
-
-        candidate_paths = []
-
-        if relevant_relations:
-
-            candidate_paths = find_exact_hop_paths(
-                adjacency=adjacency,
-                source=item["topic_entity"],
-                target=answer,
-                num_hops=item["hop"],
-                max_paths=100,
-                allowed_relations=relevant_relations,
-            )
-
-        # ====================================================
-        # FALLBACK:
-        # unrestricted graph walk
-        # ====================================================
-
-        if not candidate_paths:
-
-            candidate_paths = find_exact_hop_paths(
-                adjacency=adjacency,
-                source=item["topic_entity"],
-                target=answer,
-                num_hops=item["hop"],
-                max_paths=100,
-                allowed_relations=None,
-            )
-
-        if not candidate_paths:
-
-            support_paths[answer] = []
-            continue
-
-        # ====================================================
-        # Rank candidate paths
-        # ====================================================
-
-        ranked_paths = sorted(
-            candidate_paths,
-            key=lambda path: (
-                -score_path_semantically(
-                    path,
-                    relation_scores,
-                    target_relation,
-                ),
-                path_signature(path),
-            ),
-        )
-
-        support_paths[answer] = ranked_paths[
-            :max_paths_per_answer
-        ]
-
-    return support_paths
-
-
-# ============================================================
-# 7. CORRUPTED POSITION LABEL
-# ============================================================
-
-def get_position_label(
-    step_index,
-    total_hops,
-):
-    """
-    Hop position metadata.
-
-    1-hop:
-        answer-adjacent
-
-    2-hop:
-        early
-        answer-adjacent
-
-    3-hop:
-        early
-        middle
-        answer-adjacent
-    """
-
-    if step_index == total_hops - 1:
-        return "answer-adjacent"
-
-    if step_index == 0:
-        return "early"
-
-    return "middle"
-
-
-# ============================================================
-# 8. COLLECT SUPPORT TRIPLES
-# ============================================================
-
-def collect_support_triples(
-    support_paths,
-):
-    """
-    Bütün selected gold support paths-dəki
-    original KG triples-ları union edir.
-
-    Duplicate triple yalnız bir dəfə saxlanılır.
-    """
-
-    support_triples = []
-    seen = set()
-
-    for answer, paths in support_paths.items():
-
-        if not paths:
-            continue
-
-        # Bir canonical path / answer
-        path = paths[0]
-
-        for step in path:
-
-            triple = tuple(
-                step["triple"]
-            )
-
-            if triple in seen:
-                continue
-
-            seen.add(triple)
-            support_triples.append(
-                triple
-            )
-
-    return support_triples
-
-
-# ============================================================
-# 9. COLLECT PATH ENTITIES
-# ============================================================
-
-def collect_path_entities(
-    item,
-    support_paths,
-):
-    """
-    Context retrieval üçün topic və intermediate
-    entities-i toplayır.
-
-    Gold answer entities context anchor deyil.
-    """
-
-    entities = {
-        item["topic_entity"]
-    }
-
-    gold_answers = set(
-        item["gold_answers"]
-    )
-
-    for paths in support_paths.values():
-
-        if not paths:
-            continue
-
-        path = paths[0]
-
-        for step in path:
-
-            from_entity = step[
-                "from_entity"
-            ]
-
-            to_entity = step[
-                "to_entity"
-            ]
-
-            if from_entity not in gold_answers:
-                entities.add(
-                    from_entity
-                )
-
-            if to_entity not in gold_answers:
-                entities.add(
-                    to_entity
-                )
-
-    return entities
-
-
-# ============================================================
-# 10. STABLE DETERMINISTIC SEED
-# ============================================================
-
-def stable_seed(
-    text,
-    base_seed=DEFAULT_SEED,
-):
-    """
-    Python hash() run-lar arasında dəyişə bilər.
-
-    Ona görə SHA256 əsaslı reproducible seed istifadə olunur.
-    """
-
-    value = (
-        f"{base_seed}:{text}"
-    )
+def stable_seed(text, seed=DEFAULT_SEED):
+    value = f"{seed}:{text}"
 
     digest = hashlib.sha256(
         value.encode("utf-8")
     ).hexdigest()
 
     return int(
-        digest[:8],
+        digest[:16],
         16,
     )
 
 
 # ============================================================
-# 11. CONTEXT VALIDATION
+# 2. JSONL SAVE
 # ============================================================
 
-def is_valid_context_triple(
-    triple,
-    support_triples,
-    gold_answers,
-):
-    """
-    Context triple:
-
-    - support triple ola bilməz;
-    - gold answer entity-ni birbaşa göstərə bilməz.
-    """
-
-    if triple in support_triples:
-        return False
-
-    head, relation, tail = triple
-
-    if (
-        head in gold_answers
-        or tail in gold_answers
-    ):
-        return False
-
-    return True
-
-
-# ============================================================
-# 12. DETERMINISTIC POOL SAMPLING
-# ============================================================
-
-def add_from_candidate_pool(
-    selected,
-    selected_set,
-    candidates,
-    n_context,
-    seed_value,
-):
-    """
-    Candidate pool-u deterministic shuffle edib
-    lazım olan qədər context əlavə edir.
-    """
-
-    candidates = sorted(
-        set(candidates)
-    )
-
-    rng = random.Random(
-        seed_value
-    )
-
-    rng.shuffle(
-        candidates
-    )
-
-    for triple in candidates:
-
-        if len(selected) >= n_context:
-            break
-
-        if triple in selected_set:
-            continue
-
-        selected.append(
-            triple
-        )
-
-        selected_set.add(
-            triple
-        )
-
-
-# ============================================================
-# 13. BUILD FIXED-SIZE CONTEXT
-# ============================================================
-
-def build_context_triples(
-    item,
-    support_paths,
-    adjacency,
-    all_triples,
-    n_context=DEFAULT_CONTEXT_SIZE,
-    base_seed=DEFAULT_SEED,
-):
-    """
-    Fixed-size contextual evidence qurur.
-
-    Priority:
-
-    LEVEL 1:
-        support-path entities-in immediate neighborhood-u
-
-    LEVEL 2:
-        həmin neighborhood-un 2-hop expansion-u
-
-    LEVEL 3:
-        deterministic global KG fallback
-
-    Məqsəd:
-        mümkün olduğu qədər EXACTLY n_context triple.
-    """
-
-    support_triples = set(
-        collect_support_triples(
-            support_paths
-        )
-    )
-
-    gold_answers = set(
-        item["gold_answers"]
-    )
-
-    anchor_entities = collect_path_entities(
-        item,
-        support_paths,
-    )
-
-    selected = []
-    selected_set = set()
-
-    # ========================================================
-    # LEVEL 1
-    # Immediate local context
-    # ========================================================
-
-    level1_candidates = set()
-    level1_entities = set()
-
-    for entity in anchor_entities:
-
-        for edge in adjacency.get(
-            entity,
-            [],
-        ):
-
-            triple = tuple(
-                edge["triple"]
-            )
-
-            if not is_valid_context_triple(
-                triple,
-                support_triples,
-                gold_answers,
-            ):
-                continue
-
-            level1_candidates.add(
-                triple
-            )
-
-            level1_entities.add(
-                edge["next"]
-            )
-
-    add_from_candidate_pool(
-        selected=selected,
-        selected_set=selected_set,
-        candidates=level1_candidates,
-        n_context=n_context,
-        seed_value=stable_seed(
-            item["qid"] + ":context_level1",
-            base_seed,
-        ),
-    )
-
-    # ========================================================
-    # LEVEL 2
-    # 2-hop local expansion
-    # ========================================================
-
-    if len(selected) < n_context:
-
-        level2_candidates = set()
-
-        for entity in level1_entities:
-
-            for edge in adjacency.get(
-                entity,
-                [],
-            ):
-
-                triple = tuple(
-                    edge["triple"]
-                )
-
-                if not is_valid_context_triple(
-                    triple,
-                    support_triples,
-                    gold_answers,
-                ):
-                    continue
-
-                level2_candidates.add(
-                    triple
-                )
-
-        add_from_candidate_pool(
-            selected=selected,
-            selected_set=selected_set,
-            candidates=level2_candidates,
-            n_context=n_context,
-            seed_value=stable_seed(
-                item["qid"] + ":context_level2",
-                base_seed,
-            ),
-        )
-
-    # ========================================================
-    # LEVEL 3
-    # Global deterministic fallback
-    # ========================================================
-
-    if len(selected) < n_context:
-
-        global_candidates = []
-
-        for triple_dict in all_triples:
-
-            triple = (
-                triple_dict["head"],
-                triple_dict["relation"],
-                triple_dict["tail"],
-            )
-
-            if not is_valid_context_triple(
-                triple,
-                support_triples,
-                gold_answers,
-            ):
-                continue
-
-            if triple in selected_set:
-                continue
-
-            global_candidates.append(
-                triple
-            )
-
-        add_from_candidate_pool(
-            selected=selected,
-            selected_set=selected_set,
-            candidates=global_candidates,
-            n_context=n_context,
-            seed_value=stable_seed(
-                item["qid"] + ":context_global",
-                base_seed,
-            ),
-        )
-
-    return selected
-
-
-# ============================================================
-# 14. SERIALIZE SUPPORT PATHS
-# ============================================================
-
-def serialize_support_paths(
-    item,
-    support_paths,
-):
-    """
-    Support paths JSON-compatible formata çevrilir.
-
-    Corruption üçün lazım olacaq metadata:
-
-    - hop_index
-    - early/middle/answer-adjacent
-    - from_entity
-    - to_entity
-    - relation
-    - reverse
-    - original triple
-    """
-
-    serialized = {}
-
-    total_hops = item[
-        "hop"
-    ]
-
-    for answer, paths in support_paths.items():
-
-        serialized[
-            answer
-        ] = []
-
-        for path in paths:
-
-            serialized_path = []
-
-            for step_index, step in enumerate(
-                path
-            ):
-
-                serialized_path.append(
-                    {
-                        "hop_index":
-                            step_index + 1,
-
-                        "position":
-                            get_position_label(
-                                step_index,
-                                total_hops,
-                            ),
-
-                        "from_entity":
-                            step[
-                                "from_entity"
-                            ],
-
-                        "to_entity":
-                            step[
-                                "to_entity"
-                            ],
-
-                        "relation":
-                            step[
-                                "relation"
-                            ],
-
-                        "reverse":
-                            step[
-                                "reverse"
-                            ],
-
-                        "triple":
-                            list(
-                                step[
-                                    "triple"
-                                ]
-                            ),
-                    }
-                )
-
-            serialized[
-                answer
-            ].append(
-                serialized_path
-            )
-
-    return serialized
-
-
-# ============================================================
-# 15. BUILD CLEAN EVIDENCE E
-# ============================================================
-
-def build_clean_evidence(
-    item,
-    adjacency,
-    all_triples,
-    n_context=DEFAULT_CONTEXT_SIZE,
-    seed=DEFAULT_SEED,
-):
-    """
-    Final frozen clean evidence:
-
-        E = support triples + context triples
-    """
-
-    # ========================================================
-    # A. Semantically aligned support paths
-    # ========================================================
-
-    support_paths = find_support_paths(
-        item=item,
-        adjacency=adjacency,
-        max_paths_per_answer=1,
-    )
-
-    missing_answers = [
-        answer
-        for answer, paths
-        in support_paths.items()
-        if not paths
-    ]
-
-    # Bütün gold answers üçün support lazımdır
-    if missing_answers:
-        return None
-
-    # ========================================================
-    # B. Support triples
-    # ========================================================
-
-    support_triples = collect_support_triples(
-        support_paths
-    )
-
-    # ========================================================
-    # C. Fixed contextual triples
-    # ========================================================
-
-    context_triples = build_context_triples(
-        item=item,
-        support_paths=support_paths,
-        adjacency=adjacency,
-        all_triples=all_triples,
-        n_context=n_context,
-        base_seed=seed,
-    )
-
-    # ========================================================
-    # D. Combined evidence
-    # ========================================================
-
-    evidence = []
-
-    for triple in support_triples:
-
-        evidence.append(
-            {
-                "triple":
-                    list(triple),
-
-                "role":
-                    "support",
-            }
-        )
-
-    for triple in context_triples:
-
-        evidence.append(
-            {
-                "triple":
-                    list(triple),
-
-                "role":
-                    "context",
-            }
-        )
-
-    # Evidence order deterministic şəkildə shuffle olunur.
-    # Beləliklə support həmişə prompt-un əvvəlində görünmür.
-
-    rng = random.Random(
-        stable_seed(
-            item["qid"]
-            + ":evidence_order",
-            seed,
-        )
-    )
-
-    rng.shuffle(
-        evidence
-    )
-
-    # ========================================================
-    # E. Metadata
-    # ========================================================
-
-    relation_scores = get_question_relation_scores(
-        item["question"]
-    )
-
-    target_relation = infer_target_relation(
-        item["question"]
-    )
-
-    clean_item = {
-
-        "qid":
-            item["qid"],
-
-        "hop":
-            item["hop"],
-
-        "question":
-            item["question"],
-
-        "question_raw":
-            item["question_raw"],
-
-        "topic_entity":
-            item["topic_entity"],
-
-        "gold_answers":
-            item["gold_answers"],
-
-        "target_relation":
-            target_relation,
-
-        "question_relation_scores":
-            relation_scores,
-
-        "support_paths":
-            serialize_support_paths(
-                item,
-                support_paths,
-            ),
-
-        "support_triples":
-            [
-                list(triple)
-                for triple
-                in support_triples
-            ],
-
-        "context_triples":
-            [
-                list(triple)
-                for triple
-                in context_triples
-            ],
-
-        "evidence":
-            evidence,
-
-        "num_support_triples":
-            len(
-                support_triples
-            ),
-
-        "num_context_triples":
-            len(
-                context_triples
-            ),
-
-        "seed":
-            seed,
-    }
-
-    return clean_item
-
-
-# ============================================================
-# 16. BUILD PILOT DATASET
-# ============================================================
-
-def build_pilot_dataset(
-    adjacency,
-    all_triples,
-    n_per_hop=100,
-    n_context=DEFAULT_CONTEXT_SIZE,
-    seed=DEFAULT_SEED,
-):
-    """
-    Pilot dataset:
-
-        100 x 1-hop
-        100 x 2-hop
-        100 x 3-hop
-
-    Total target:
-        300 VALID clean items.
-
-    Əvvəlki versiyadan fərqli olaraq,
-    ilk 100 sample-dan problemli item çıxsa belə
-    növbəti item-lərlə əvəz edilir.
-    """
-
-    pilot = []
-
-    for hop in [1, 2, 3]:
-
-        all_items = load_questions(
-            hop
-        )
-
-        rng = random.Random(
-            seed + hop
-        )
-
-        shuffled_items = list(
-            all_items
-        )
-
-        rng.shuffle(
-            shuffled_items
-        )
-
-        built = 0
-        rejected = 0
-
-        for item in shuffled_items:
-
-            if built >= n_per_hop:
-                break
-
-            clean_item = build_clean_evidence(
-                item=item,
-                adjacency=adjacency,
-                all_triples=all_triples,
-                n_context=n_context,
-                seed=seed,
-            )
-
-            if clean_item is None:
-
-                rejected += 1
-                continue
-
-            pilot.append(
-                clean_item
-            )
-
-            built += 1
-
-        print(
-            f"{hop}-hop clean items: "
-            f"{built}/{n_per_hop} "
-            f"(rejected={rejected})"
-        )
-
-    return pilot
-
-
-# ============================================================
-# 17. SAVE JSONL
-# ============================================================
-
-def save_jsonl(
-    items,
-    path,
-):
-    """
-    JSON Lines format:
-
-        one sample = one line
-    """
-
+def save_jsonl(items, path):
     path.parent.mkdir(
         parents=True,
         exist_ok=True,
@@ -1376,169 +65,3044 @@ def save_jsonl(
 
         for item in items:
 
-            line = json.dumps(
-                item,
-                ensure_ascii=False,
-            )
-
             f.write(
-                line + "\n"
+                json.dumps(
+                    item,
+                    ensure_ascii=False,
+                )
+                + "\n"
             )
 
 
 # ============================================================
-# 18. PRINT SUPPORT PATH
+# 3. NORMALIZE KG
 # ============================================================
 
-def print_support_path(
-    answer,
-    paths,
-):
+def normalize_kb_triples(raw_triples):
     """
-    Debug/inspection üçün human-readable path.
+    load_kb() dict və ya tuple/list qaytarsa da:
+
+        (head, relation, tail)
+
+    formatına çevirir.
     """
 
-    print(
-        f"Answer: {answer}"
-    )
+    normalized = []
 
-    if not paths:
+    for item in raw_triples:
 
-        print(
-            "  NO PATH"
+        if isinstance(item, dict):
+
+            if all(
+                key in item
+                for key in (
+                    "head",
+                    "relation",
+                    "tail",
+                )
+            ):
+                head = item["head"]
+                relation = item["relation"]
+                tail = item["tail"]
+
+            elif all(
+                key in item
+                for key in (
+                    "subject",
+                    "predicate",
+                    "object",
+                )
+            ):
+                head = item["subject"]
+                relation = item["predicate"]
+                tail = item["object"]
+
+            elif all(
+                key in item
+                for key in (
+                    "h",
+                    "r",
+                    "t",
+                )
+            ):
+                head = item["h"]
+                relation = item["r"]
+                tail = item["t"]
+
+            else:
+                raise ValueError(
+                    "Unknown KB dictionary format: "
+                    f"{item}"
+                )
+
+        elif (
+            isinstance(
+                item,
+                (tuple, list),
+            )
+            and len(item) == 3
+        ):
+            head, relation, tail = item
+
+        else:
+            raise ValueError(
+                "Unknown KB triple format: "
+                f"{item}"
+            )
+
+        normalized.append(
+            (
+                str(head),
+                str(relation),
+                str(tail),
+            )
         )
 
-        return
+    return normalized
 
-    for path in paths:
 
-        for step in path:
+# ============================================================
+# 4. BUILD BIDIRECTIONAL ADJACENCY
+# ============================================================
 
-            reverse_mark = (
+def build_adjacency(triples):
+    """
+    Original KG:
+
+        head | relation | tail
+
+    Traversal üçün:
+
+        head -> tail
+        tail -> head
+
+    yaradılır.
+
+    reverse=True original triple-ın əks istiqamətdə
+    traverse edildiyini göstərir.
+    """
+
+    adjacency = defaultdict(list)
+
+    for head, relation, tail in triples:
+
+        original_triple = (
+            head,
+            relation,
+            tail,
+        )
+
+        # Forward
+        adjacency[head].append(
+            {
+                "to_entity": tail,
+                "relation": relation,
+                "reverse": False,
+                "triple": original_triple,
+            }
+        )
+
+        # Reverse
+        adjacency[tail].append(
+            {
+                "to_entity": head,
+                "relation": relation,
+                "reverse": True,
+                "triple": original_triple,
+            }
+        )
+
+    for entity in adjacency:
+
+        adjacency[entity] = sorted(
+            adjacency[entity],
+            key=lambda edge: (
+                edge["relation"],
+                edge["to_entity"],
+                edge["reverse"],
+                edge["triple"],
+            ),
+        )
+
+    return adjacency
+
+
+# ============================================================
+# 5. QUESTION NORMALIZATION
+# ============================================================
+
+def normalize_question(question):
+    return (
+        question
+        .lower()
+        .replace("’", "'")
+        .replace("–", "-")
+        .strip()
+    )
+
+
+# ============================================================
+# 6. QUESTION RELATION SCORES
+# ============================================================
+
+def get_question_relation_scores(question):
+    """
+    Metadata/debug üçün soft lexical scores.
+
+    Support path selection strict profile ilə edilir;
+    bu score əsas seçim mexanizmi deyil.
+    """
+
+    q = normalize_question(
+        question
+    )
+
+    scores = {
+        "directed_by": 0.0,
+        "written_by": 0.0,
+        "starred_actors": 0.0,
+        "has_genre": 0.0,
+        "in_language": 0.0,
+        "release_year": 0.0,
+        "has_imdb_rating": 0.0,
+        "has_imdb_votes": 0.0,
+        "has_tags": 0.0,
+    }
+
+    patterns = {
+        "directed_by":
+            r"\b(?:directed|director|directors)\b",
+
+        "written_by":
+            r"\b(?:written|wrote|writer|writers|"
+            r"screenwriter|screenwriters)\b",
+
+        "starred_actors":
+            r"\b(?:actor|actors|actress|actresses|"
+            r"act|acted|star|stars|starred|starring|"
+            r"appear|appears|appeared)\b",
+
+        "has_genre":
+            r"\b(?:genre|genres|type|types|kind|kinds)\b",
+
+        "in_language":
+            r"\blanguages?\b",
+
+        "release_year":
+            r"\b(?:release|released|year|years|when)\b",
+
+        "has_imdb_rating":
+            r"\b(?:imdb\s+)?ratings?\b",
+
+        "has_imdb_votes":
+            r"\b(?:imdb\s+)?votes?\b",
+
+        "has_tags":
+            r"\btags?\b",
+    }
+
+    for relation, pattern in patterns.items():
+
+        scores[relation] = float(
+            len(
+                re.findall(
+                    pattern,
+                    q,
+                )
+            )
+        )
+
+    return scores
+
+
+# ============================================================
+# 7. FIRST MATCH POSITION
+# ============================================================
+
+def first_match_position(text, pattern):
+    match = re.search(
+        pattern,
+        text,
+    )
+
+    if match is None:
+        return None
+
+    return match.start()
+
+
+# ============================================================
+# 8. INFER TARGET / FINAL RELATION
+# ============================================================
+
+def infer_target_relation(question):
+    """
+    Question-un tələb etdiyi FINAL answer relation.
+
+    Support path-in son traversal step-i bu relation
+    olmalıdır.
+    """
+
+    q = normalize_question(
+        question
+    )
+
+    # ========================================================
+    # A. VALUE-TYPE ANSWERS
+    # ========================================================
+
+    if re.search(
+        r"\b(?:imdb\s+)?votes?\b",
+        q,
+    ):
+        return "has_imdb_votes"
+
+    if re.search(
+        r"\b(?:imdb\s+)?ratings?\b",
+        q,
+    ):
+        return "has_imdb_rating"
+
+    if re.search(
+        r"\btags?\b",
+        q,
+    ):
+        return "has_tags"
+
+    if re.search(
+        r"\blanguages?\b",
+        q,
+    ):
+        return "in_language"
+
+    if (
+        re.search(
+            r"^\s*when\b",
+            q,
+        )
+        or re.search(
+            r"\brelease\s+years?\b",
+            q,
+        )
+        or re.search(
+            r"\breleased\s+(?:in|when)\b",
+            q,
+        )
+        or re.search(
+            r"\bwhat\s+year\b",
+            q,
+        )
+        or re.search(
+            r"\bwhich\s+year\b",
+            q,
+        )
+        or re.search(
+            r"\byears?\s+(?:was|were|did)\b",
+            q,
+        )
+    ):
+        return "release_year"
+
+    if (
+        re.search(
+            r"\bgenres?\b",
+            q,
+        )
+        or re.search(
+            r"\bwhat\s+(?:kind|type)\s+of\s+"
+            r"(?:film|movie)\b",
+            q,
+        )
+        or re.search(
+            r"\bwhat\s+(?:kind|type)\b",
+            q,
+        )
+        or re.search(
+            r"\bwhat\s+types?\b",
+            q,
+        )
+    ):
+        return "has_genre"
+
+    # ========================================================
+    # B. STRONG DIRECTOR ANSWER PATTERNS
+    # ========================================================
+
+    if re.search(
+        r"\bdirected\s+by\s+"
+        r"(?:who|which\s+person)\s*\??$",
+        q,
+    ):
+        return "directed_by"
+
+    if re.search(
+        r"\b(?:who|which\s+person)\s+"
+        r"(?:is|was)?\s*"
+        r"(?:listed\s+as\s+)?"
+        r"(?:the\s+)?director\b",
+        q,
+    ):
+        return "directed_by"
+
+    # ========================================================
+    # C. STRONG WRITER ANSWER PATTERNS
+    # ========================================================
+
+    if re.search(
+        r"\bwritten\s+by\s+"
+        r"(?:who|which\s+person|this\s+person)\s*\??$",
+        q,
+    ):
+        return "written_by"
+
+    if re.search(
+        r"\b(?:who|which\s+person)\s+"
+        r"(?:is|was)?\s*"
+        r"(?:listed\s+as\s+)?"
+        r"(?:the\s+)?"
+        r"(?:writer|screenwriter)\b",
+        q,
+    ):
+        return "written_by"
+
+    # ========================================================
+    # D. STRONG ACTOR ANSWER PATTERNS
+    # ========================================================
+
+    if re.search(
+        r"\b(?:starred|stars|acted)\s+"
+        r"(?:who|which\s+person)\s*\??$",
+        q,
+    ):
+        return "starred_actors"
+
+    # ========================================================
+    # E. REVERSE MOVIE QUESTIONS
+    # ========================================================
+
+    # what does X star in
+    if re.search(
+        r"\bwhat\s+does\b.*\bstar\s+in\b",
+        q,
+    ):
+        return "starred_actors"
+
+    # what does X act in
+    if re.search(
+        r"\bwhat\s+does\b.*\bact\s+in\b",
+        q,
+    ):
+        return "starred_actors"
+
+    # what/which films did X act/star/appear in
+    if (
+        re.search(
+            r"\b(?:films?|movies?)\b",
+            q,
+        )
+        and re.search(
+            r"\b(?:act|acted|star|starred|"
+            r"appear|appears|appeared)\b",
+            q,
+        )
+    ):
+        return "starred_actors"
+
+    # ========================================================
+    # F. QUESTION PREFIX PERSON INTENT
+    # ========================================================
+
+    if re.search(
+        r"^\s*(?:who|which\s+person|"
+        r"what\s+(?:films?|movies?)|"
+        r"which\s+(?:films?|movies?))\b",
+        q,
+    ):
+
+        positions = {}
+
+        directed_position = (
+            first_match_position(
+                q,
+                r"\b(?:directed|director|directors)\b",
+            )
+        )
+
+        written_position = (
+            first_match_position(
+                q,
+                r"\b(?:written|wrote|writer|writers|"
+                r"screenwriter|screenwriters)\b",
+            )
+        )
+
+        actor_position = (
+            first_match_position(
+                q,
+                r"\b(?:act|acted|star|stars|starred|starring|"
+                r"actor|actors|appear|appears|appeared)\b",
+            )
+        )
+
+        if directed_position is not None:
+            positions[
+                "directed_by"
+            ] = directed_position
+
+        if written_position is not None:
+            positions[
+                "written_by"
+            ] = written_position
+
+        if actor_position is not None:
+            positions[
+                "starred_actors"
+            ] = actor_position
+
+        if positions:
+
+            return min(
+                positions,
+                key=positions.get,
+            )
+
+    # ========================================================
+    # G. ONLY WRITER RELATION PRESENT
+    # ========================================================
+
+    if (
+        re.search(
+            r"\b(?:films?|movies?)\b",
+            q,
+        )
+        and re.search(
+            r"\b(?:writer|writers|screenwriter|screenwriters|"
+            r"written|wrote)\b",
+            q,
+        )
+        and not re.search(
+            r"\b(?:directed|director|"
+            r"act|acted|starred|actors?)\b",
+            q,
+        )
+    ):
+        return "written_by"
+
+    # ========================================================
+    # H. ONLY DIRECTOR RELATION PRESENT
+    # ========================================================
+
+    if (
+        re.search(
+            r"\b(?:films?|movies?)\b",
+            q,
+        )
+        and re.search(
+            r"\b(?:directed|director|directors)\b",
+            q,
+        )
+        and not re.search(
+            r"\b(?:written|writer|screenwriter|"
+            r"act|acted|starred|actors?)\b",
+            q,
+        )
+    ):
+        return "directed_by"
+
+    # ========================================================
+    # I. ENDING CUES
+    # ========================================================
+
+    if re.search(
+        r"\b(?:director|directors)\s*\??$",
+        q,
+    ):
+        return "directed_by"
+
+    if re.search(
+        r"\b(?:writer|writers|"
+        r"screenwriter|screenwriters)\s*\??$",
+        q,
+    ):
+        return "written_by"
+
+    if re.search(
+        r"\b(?:actor|actors|"
+        r"actress|actresses)\s*\??$",
+        q,
+    ):
+        return "starred_actors"
+
+    # ========================================================
+    # J. FALLBACK IF ONLY ONE PERSON RELATION EXISTS
+    # ========================================================
+
+    person_relations = set()
+
+    if re.search(
+        r"\b(?:directed|director|directors)\b",
+        q,
+    ):
+        person_relations.add(
+            "directed_by"
+        )
+
+    if re.search(
+        r"\b(?:written|wrote|writer|writers|"
+        r"screenwriter|screenwriters)\b",
+        q,
+    ):
+        person_relations.add(
+            "written_by"
+        )
+
+    if re.search(
+        r"\b(?:actor|actors|actress|actresses|"
+        r"act|acted|star|stars|starred|starring|"
+        r"appear|appears|appeared)\b",
+        q,
+    ):
+        person_relations.add(
+            "starred_actors"
+        )
+
+    if len(person_relations) == 1:
+
+        return next(
+            iter(
+                person_relations
+            )
+        )
+
+    return None
+
+
+# ============================================================
+# 9. COUNT PERSON-RELATION MENTIONS
+# ============================================================
+
+def count_person_relation_mentions(question):
+    q = normalize_question(
+        question
+    )
+
+    counts = Counter()
+
+    directed_events = re.findall(
+        r"\b(?:directed|director|directors)\b",
+        q,
+    )
+
+    written_events = re.findall(
+        r"\b(?:written|wrote|writer|writers|"
+        r"screenwriter|screenwriters)\b",
+        q,
+    )
+
+    actor_events = re.findall(
+        r"\b(?:actor|actors|actress|actresses|"
+        r"act|acted|star|stars|starred|starring|"
+        r"appear|appears|appeared)\b",
+        q,
+    )
+
+    if directed_events:
+        counts[
+            "directed_by"
+        ] = len(
+            directed_events
+        )
+
+    if written_events:
+        counts[
+            "written_by"
+        ] = len(
+            written_events
+        )
+
+    if actor_events:
+        counts[
+            "starred_actors"
+        ] = len(
+            actor_events
+        )
+
+    return counts
+
+
+# ============================================================
+# 10. INFER REQUIRED RELATION PROFILE
+# ============================================================
+
+def infer_required_relation_counts(
+    question,
+    hop,
+    target_relation,
+):
+    """
+    Example:
+
+    who directed movies written by X
+
+        written_by: 1
+        directed_by: 1
+
+    genres of films that share actors with X
+
+        starred_actors: 2
+        has_genre: 1
+    """
+
+    q = normalize_question(
+        question
+    )
+
+    counts = (
+        count_person_relation_mentions(
+            question
+        )
+    )
+
+    # ========================================================
+    # VALUE RELATIONS
+    # ========================================================
+
+    if (
+        target_relation == "has_genre"
+        or re.search(
+            r"\b(?:genres?|types?|kinds?)\b",
+            q,
+        )
+    ):
+        counts[
+            "has_genre"
+        ] = max(
+            counts["has_genre"],
+            1,
+        )
+
+    if (
+        target_relation == "in_language"
+        or re.search(
+            r"\blanguages?\b",
+            q,
+        )
+    ):
+        counts[
+            "in_language"
+        ] = max(
+            counts["in_language"],
+            1,
+        )
+
+    if (
+        target_relation == "release_year"
+        or re.search(
+            r"\brelease\s+years?\b",
+            q,
+        )
+        or re.search(
+            r"\breleased\b",
+            q,
+        )
+        or re.search(
+            r"^\s*when\b",
+            q,
+        )
+    ):
+        counts[
+            "release_year"
+        ] = max(
+            counts["release_year"],
+            1,
+        )
+
+    if (
+        target_relation == "has_imdb_rating"
+        or re.search(
+            r"\b(?:imdb\s+)?ratings?\b",
+            q,
+        )
+    ):
+        counts[
+            "has_imdb_rating"
+        ] = max(
+            counts["has_imdb_rating"],
+            1,
+        )
+
+    if (
+        target_relation == "has_imdb_votes"
+        or re.search(
+            r"\b(?:imdb\s+)?votes?\b",
+            q,
+        )
+    ):
+        counts[
+            "has_imdb_votes"
+        ] = max(
+            counts["has_imdb_votes"],
+            1,
+        )
+
+    if (
+        target_relation == "has_tags"
+        or re.search(
+            r"\btags?\b",
+            q,
+        )
+    ):
+        counts[
+            "has_tags"
+        ] = max(
+            counts["has_tags"],
+            1,
+        )
+
+    # ========================================================
+    # SHARED PROPERTY = RELATION USED TWICE
+    # ========================================================
+
+    shared_patterns = {
+        "directed_by":
+            r"\b(?:share|shares|shared|same)\b.*"
+            r"\b(?:director|directors)\b",
+
+        "written_by":
+            r"\b(?:share|shares|shared|same)\b.*"
+            r"\b(?:writer|writers|"
+            r"screenwriter|screenwriters)\b",
+
+        "starred_actors":
+            r"\b(?:share|shares|shared|same)\b.*"
+            r"\b(?:actor|actors|"
+            r"actress|actresses)\b",
+    }
+
+    for relation, pattern in (
+        shared_patterns.items()
+    ):
+
+        if re.search(
+            pattern,
+            q,
+        ):
+            counts[
+                relation
+            ] = max(
+                counts[relation],
+                2,
+            )
+
+    # acted/starred together with X
+    if re.search(
+        r"\b(?:acted|starred)\s+"
+        r"together\s+with\b",
+        q,
+    ):
+        counts[
+            "starred_actors"
+        ] = max(
+            counts[
+                "starred_actors"
+            ],
+            2,
+        )
+
+    # ========================================================
+    # TARGET RELATION ALWAYS REQUIRED
+    # ========================================================
+
+    if target_relation is not None:
+
+        counts[
+            target_relation
+        ] = max(
+            counts[
+                target_relation
+            ],
+            1,
+        )
+
+    # lexical mention cannot exceed hop count
+    for relation in list(
+        counts.keys()
+    ):
+
+        counts[
+            relation
+        ] = min(
+            counts[
+                relation
+            ],
+            hop,
+        )
+
+    return Counter(
+        {
+            relation: count
+            for relation, count
+            in counts.items()
+            if count > 0
+        }
+    )
+
+
+# ============================================================
+# 11. TARGET RELATION AUDIT
+# ============================================================
+
+def audit_target_relation_coverage():
+    rows = []
+
+    print()
+    print(
+        "Auditing target-relation inference..."
+    )
+
+    for hop in (
+        1,
+        2,
+        3,
+    ):
+
+        questions = list(
+            load_questions(
+                hop
+            )
+        )
+
+        missing = []
+
+        counts = Counter()
+
+        for item in questions:
+
+            relation = (
+                infer_target_relation(
+                    item["question"]
+                )
+            )
+
+            if relation is None:
+
+                missing.append(
+                    item
+                )
+
+                rows.append(
+                    {
+                        "qid":
+                            item[
+                                "qid"
+                            ],
+
+                        "hop":
+                            hop,
+
+                        "question":
+                            item[
+                                "question"
+                            ],
+
+                        "status":
+                            "target_relation_not_inferred",
+                    }
+                )
+
+            else:
+
+                counts[
+                    relation
+                ] += 1
+
+        inferred = (
+            len(questions)
+            - len(missing)
+        )
+
+        coverage = (
+            100.0
+            * inferred
+            / len(questions)
+        )
+
+        print(
+            f"{hop}-hop target inference: "
+            f"{inferred}/{len(questions)} "
+            f"({coverage:.2f}%)"
+        )
+
+        print(
+            "  Relations:",
+            dict(
+                counts
+            ),
+        )
+
+        if missing:
+
+            print(
+                "  First unmatched examples:"
+            )
+
+            for item in missing[:5]:
+
+                print(
+                    "   -",
+                    item[
+                        "question"
+                    ],
+                )
+
+    save_jsonl(
+        rows,
+        TARGET_AUDIT_PATH,
+    )
+
+    print(
+        "Target audit saved:",
+        TARGET_AUDIT_PATH,
+    )
+
+
+# ============================================================
+# 12. EXACT-HOP WALK SEARCH
+# ============================================================
+
+def find_exact_hop_paths(
+    adjacency,
+    start_entity,
+    target_entity,
+    hops,
+    relation_profile,
+    max_paths=MAX_PATHS,
+):
+    """
+    Exact-hop WALK.
+
+    Node repetition allowed.
+
+    Candidate path yalnız exact semantic relation profile
+    istifadə edə bilər.
+    """
+
+    results = []
+
+    path = []
+
+    relation_counter = Counter()
+
+    allowed_relations = set(
+        relation_profile.keys()
+    )
+
+    def dfs(
+        current_entity,
+        depth,
+    ):
+        if len(results) >= max_paths:
+            return
+
+        if depth == hops:
+
+            if (
+                current_entity
+                == target_entity
+                and relation_counter
+                == relation_profile
+            ):
+                results.append(
+                    list(
+                        path
+                    )
+                )
+
+            return
+
+        remaining_steps = (
+            hops
+            - depth
+        )
+
+        required_remaining = sum(
+            max(
+                0,
+                relation_profile[relation]
+                - relation_counter[
+                    relation
+                ],
+            )
+            for relation
+            in relation_profile
+        )
+
+        if (
+            required_remaining
+            > remaining_steps
+        ):
+            return
+
+        for edge in adjacency.get(
+            current_entity,
+            [],
+        ):
+
+            relation = (
+                edge[
+                    "relation"
+                ]
+            )
+
+            if (
+                relation
+                not in allowed_relations
+            ):
+                continue
+
+            if (
+                relation_counter[
+                    relation
+                ]
+                >= relation_profile[
+                    relation
+                ]
+            ):
+                continue
+
+            step = {
+                "from_entity":
+                    current_entity,
+
+                "to_entity":
+                    edge[
+                        "to_entity"
+                    ],
+
+                "relation":
+                    relation,
+
+                "reverse":
+                    edge[
+                        "reverse"
+                    ],
+
+                "triple":
+                    edge[
+                        "triple"
+                    ],
+            }
+
+            path.append(
+                step
+            )
+
+            relation_counter[
+                relation
+            ] += 1
+
+            dfs(
+                edge[
+                    "to_entity"
+                ],
+                depth + 1,
+            )
+
+            relation_counter[
+                relation
+            ] -= 1
+
+            if (
+                relation_counter[
+                    relation
+                ]
+                == 0
+            ):
+                del relation_counter[
+                    relation
+                ]
+
+            path.pop()
+
+    dfs(
+        start_entity,
+        0,
+    )
+
+    return results
+
+
+# ============================================================
+# 13. PATH VALIDATION
+# ============================================================
+
+def validate_path_semantics(
+    path,
+    hop,
+    target_relation,
+    relation_profile,
+):
+    if len(path) != hop:
+        return False
+
+    if not path:
+        return False
+
+    if (
+        path[-1][
+            "relation"
+        ]
+        != target_relation
+    ):
+        return False
+
+    actual_profile = Counter(
+        step[
+            "relation"
+        ]
+        for step in path
+    )
+
+    if (
+        actual_profile
+        != relation_profile
+    ):
+        return False
+
+    return True
+
+
+# ============================================================
+# 14. DETERMINISTIC PATH KEY
+# ============================================================
+
+def path_sort_key(path):
+    return tuple(
+        (
+            step[
+                "from_entity"
+            ],
+            step[
+                "relation"
+            ],
+            step[
+                "to_entity"
+            ],
+            step[
+                "reverse"
+            ],
+        )
+        for step in path
+    )
+
+
+# ============================================================
+# 15. FIND CANONICAL SUPPORT PATH
+# ============================================================
+
+def find_support_paths(
+    adjacency,
+    question,
+    topic_entity,
+    gold_answer,
+    hop,
+):
+    target_relation = (
+        infer_target_relation(
+            question
+        )
+    )
+
+    if target_relation is None:
+        return []
+
+    relation_profile = (
+        infer_required_relation_counts(
+            question=
+                question,
+
+            hop=
+                hop,
+
+            target_relation=
+                target_relation,
+        )
+    )
+
+    # Strict semantic profile must explain every hop.
+    if (
+        sum(
+            relation_profile.values()
+        )
+        != hop
+    ):
+        return []
+
+    candidate_paths = (
+        find_exact_hop_paths(
+            adjacency=
+                adjacency,
+
+            start_entity=
+                topic_entity,
+
+            target_entity=
+                gold_answer,
+
+            hops=
+                hop,
+
+            relation_profile=
+                relation_profile,
+
+            max_paths=
+                MAX_PATHS,
+        )
+    )
+
+    valid_paths = [
+        path
+        for path
+        in candidate_paths
+        if validate_path_semantics(
+            path=
+                path,
+
+            hop=
+                hop,
+
+            target_relation=
+                target_relation,
+
+            relation_profile=
+                relation_profile,
+        )
+    ]
+
+    if not valid_paths:
+        return []
+
+    valid_paths = sorted(
+        valid_paths,
+        key=
+            path_sort_key,
+    )
+
+    return [
+        valid_paths[0]
+    ]
+
+
+# ============================================================
+# 16. POSITION LABEL
+# ============================================================
+
+def get_position_label(
+    step_index,
+    total_hops,
+):
+    if (
+        step_index
+        == total_hops - 1
+    ):
+        return "answer-adjacent"
+
+    if step_index == 0:
+        return "early"
+
+    return "middle"
+
+
+# ============================================================
+# 17. SERIALIZE PATH
+# ============================================================
+
+def serialize_path(path):
+    output = []
+
+    total_hops = len(
+        path
+    )
+
+    for i, step in enumerate(
+        path
+    ):
+
+        output.append(
+            {
+                "hop_index":
+                    i + 1,
+
+                "position":
+                    get_position_label(
+                        i,
+                        total_hops,
+                    ),
+
+                "from_entity":
+                    step[
+                        "from_entity"
+                    ],
+
+                "to_entity":
+                    step[
+                        "to_entity"
+                    ],
+
+                "relation":
+                    step[
+                        "relation"
+                    ],
+
+                "reverse":
+                    step[
+                        "reverse"
+                    ],
+
+                "triple":
+                    list(
+                        step[
+                            "triple"
+                        ]
+                    ),
+            }
+        )
+
+    return output
+
+
+# ============================================================
+# 18. COLLECT SUPPORT TRIPLES
+# ============================================================
+
+def collect_support_triples(
+    support_paths,
+):
+    output = []
+
+    seen = set()
+
+    for answer in sorted(
+        support_paths.keys()
+    ):
+
+        paths = (
+            support_paths[
+                answer
+            ]
+        )
+
+        if not paths:
+            continue
+
+        for step in paths[0]:
+
+            triple = tuple(
+                step[
+                    "triple"
+                ]
+            )
+
+            if triple in seen:
+                continue
+
+            seen.add(
+                triple
+            )
+
+            output.append(
+                triple
+            )
+
+    return output
+
+
+# ============================================================
+# 19. COLLECT PATH ENTITIES
+# ============================================================
+
+def collect_path_entities(
+    topic_entity,
+    gold_answers,
+    support_paths,
+):
+    entities = {
+        topic_entity
+    }
+
+    gold_set = set(
+        gold_answers
+    )
+
+    for paths in (
+        support_paths.values()
+    ):
+
+        if not paths:
+            continue
+
+        for step in paths[0]:
+
+            for entity in (
+                step[
+                    "from_entity"
+                ],
+                step[
+                    "to_entity"
+                ],
+            ):
+
+                if (
+                    entity
+                    not in gold_set
+                ):
+                    entities.add(
+                        entity
+                    )
+
+    return entities
+
+
+# ============================================================
+# 20. COLLECT ANSWER-SLOT CONSTRAINTS
+# ============================================================
+
+def collect_answer_slot_constraints(
+    support_paths,
+):
+    """
+    Clean context-də competing answer fact-ləri bloklamaq üçün.
+
+    Hər canonical support path-in final traversal step-i:
+
+        source entity
+        relation
+        direction
+
+    saxlanılır.
+
+    Example forward:
+
+        Movie -> directed_by -> Director
+
+    source=Movie
+    relation=directed_by
+    reverse=False
+
+    Example reverse:
+
+        Actor -> starred_actors^-1 -> Movie
+
+    source=Actor
+    relation=starred_actors
+    reverse=True
+    """
+
+    constraints = []
+
+    seen = set()
+
+    for paths in (
+        support_paths.values()
+    ):
+
+        if not paths:
+            continue
+
+        path = paths[0]
+
+        if not path:
+            continue
+
+        final_step = path[-1]
+
+        constraint = (
+            final_step[
+                "from_entity"
+            ],
+            final_step[
+                "relation"
+            ],
+            final_step[
+                "reverse"
+            ],
+        )
+
+        if constraint in seen:
+            continue
+
+        seen.add(
+            constraint
+        )
+
+        constraints.append(
+            constraint
+        )
+
+    return constraints
+
+
+# ============================================================
+# 21. VALID CLEAN CONTEXT TRIPLE
+# ============================================================
+
+def valid_context_triple(
+    triple,
+    support_set,
+    gold_set,
+    answer_slot_constraints,
+):
+    """
+    Clean context safety rules.
+
+    Reject:
+    1. support triple itself
+    2. triples touching gold answer entities
+    3. any triple that would introduce a competing answer
+       for the SAME final reasoning slot
+
+    Example:
+
+    Question:
+        who directed Captain America?
+
+    Support:
+        Captain America | directed_by | Rod Holcomb
+
+    Context candidate:
+        Captain America | directed_by | Albert Pyun
+
+    This is rejected because it creates clean-condition
+    answer ambiguity.
+    """
+
+    if triple in support_set:
+        return False
+
+    head, relation, tail = triple
+
+    if head in gold_set:
+        return False
+
+    if tail in gold_set:
+        return False
+
+    # ========================================================
+    # COMPETING ANSWER PROTECTION
+    # ========================================================
+
+    for (
+        source_entity,
+        target_relation,
+        reverse,
+    ) in answer_slot_constraints:
+
+        if (
+            relation
+            != target_relation
+        ):
+            continue
+
+        # Forward traversal:
+        #
+        # source --relation--> answer
+        if (
+            not reverse
+            and head
+            == source_entity
+        ):
+            return False
+
+        # Reverse traversal:
+        #
+        # source <--relation-- answer
+        #
+        # Original triple:
+        # answer | relation | source
+        if (
+            reverse
+            and tail
+            == source_entity
+        ):
+            return False
+
+    return True
+
+
+# ============================================================
+# 22. DETERMINISTIC CONTEXT ORDER
+# ============================================================
+
+def deterministic_triple_order(
+    triples,
+    qid,
+    label,
+    seed=DEFAULT_SEED,
+):
+    return sorted(
+        triples,
+        key=lambda triple:
+            stable_seed(
+                (
+                    f"{qid}:"
+                    f"{label}:"
+                    f"{triple[0]}|"
+                    f"{triple[1]}|"
+                    f"{triple[2]}"
+                ),
+                seed,
+            ),
+    )
+
+
+# ============================================================
+# 23. BUILD FIXED CONTEXT
+# ============================================================
+
+def build_context_triples(
+    item,
+    triples,
+    adjacency,
+    support_paths,
+    support_triples,
+    target_size=CONTEXT_SIZE,
+    seed=DEFAULT_SEED,
+):
+    qid = item[
+        "qid"
+    ]
+
+    gold_set = set(
+        item[
+            "gold_answers"
+        ]
+    )
+
+    support_set = set(
+        support_triples
+    )
+
+    path_entities = (
+        collect_path_entities(
+            topic_entity=
+                item[
+                    "topic_entity"
+                ],
+
+            gold_answers=
+                item[
+                    "gold_answers"
+                ],
+
+            support_paths=
+                support_paths,
+        )
+    )
+
+    answer_slot_constraints = (
+        collect_answer_slot_constraints(
+            support_paths
+        )
+    )
+
+    selected = []
+
+    selected_set = set()
+
+    # ========================================================
+    # HELPER
+    # ========================================================
+
+    def add_candidates(
+        candidates,
+        label,
+    ):
+        ordered = (
+            deterministic_triple_order(
+                triples=
+                    candidates,
+
+                qid=
+                    qid,
+
+                label=
+                    label,
+
+                seed=
+                    seed,
+            )
+        )
+
+        for triple in ordered:
+
+            triple = tuple(
+                triple
+            )
+
+            if (
+                triple
+                in selected_set
+            ):
+                continue
+
+            if not valid_context_triple(
+                triple=
+                    triple,
+
+                support_set=
+                    support_set,
+
+                gold_set=
+                    gold_set,
+
+                answer_slot_constraints=
+                    answer_slot_constraints,
+            ):
+                continue
+
+            selected.append(
+                triple
+            )
+
+            selected_set.add(
+                triple
+            )
+
+            if (
+                len(selected)
+                >= target_size
+            ):
+                return True
+
+        return False
+
+    # ========================================================
+    # LEVEL 1: PATH-LOCAL NEIGHBORHOOD
+    # ========================================================
+
+    level1 = set()
+
+    neighbor_entities = set()
+
+    for entity in path_entities:
+
+        for edge in adjacency.get(
+            entity,
+            [],
+        ):
+
+            level1.add(
+                tuple(
+                    edge[
+                        "triple"
+                    ]
+                )
+            )
+
+            neighbor_entities.add(
+                edge[
+                    "to_entity"
+                ]
+            )
+
+    if add_candidates(
+        level1,
+        "level1",
+    ):
+        return selected
+
+    # ========================================================
+    # LEVEL 2: TWO-HOP NEIGHBORHOOD
+    # ========================================================
+
+    level2 = set()
+
+    for entity in neighbor_entities:
+
+        for edge in adjacency.get(
+            entity,
+            [],
+        ):
+
+            level2.add(
+                tuple(
+                    edge[
+                        "triple"
+                    ]
+                )
+            )
+
+    if add_candidates(
+        level2,
+        "level2",
+    ):
+        return selected
+
+    # ========================================================
+    # LEVEL 3: GLOBAL FALLBACK
+    # ========================================================
+
+    if triples:
+
+        start_index = (
+            stable_seed(
+                (
+                    f"{qid}:"
+                    "global-context-start"
+                ),
+                seed,
+            )
+            % len(triples)
+        )
+
+        for offset in range(
+            len(triples)
+        ):
+
+            index = (
+                start_index
+                + offset
+            ) % len(triples)
+
+            triple = tuple(
+                triples[
+                    index
+                ]
+            )
+
+            if (
+                triple
+                in selected_set
+            ):
+                continue
+
+            if not valid_context_triple(
+                triple=
+                    triple,
+
+                support_set=
+                    support_set,
+
+                gold_set=
+                    gold_set,
+
+                answer_slot_constraints=
+                    answer_slot_constraints,
+            ):
+                continue
+
+            selected.append(
+                triple
+            )
+
+            selected_set.add(
+                triple
+            )
+
+            if (
+                len(selected)
+                >= target_size
+            ):
+                break
+
+    return selected
+
+
+# ============================================================
+# 24. BUILD ONE CLEAN ITEM
+# ============================================================
+
+def build_clean_evidence(
+    question_item,
+    triples,
+    adjacency,
+    context_size=CONTEXT_SIZE,
+    seed=DEFAULT_SEED,
+):
+    question = (
+        question_item[
+            "question"
+        ]
+    )
+
+    hop = (
+        question_item[
+            "hop"
+        ]
+    )
+
+    topic_entity = (
+        question_item[
+            "topic_entity"
+        ]
+    )
+
+    gold_answers = (
+        question_item[
+            "gold_answers"
+        ]
+    )
+
+    target_relation = (
+        infer_target_relation(
+            question
+        )
+    )
+
+    if target_relation is None:
+
+        return (
+            None,
+            "target_relation_not_inferred",
+        )
+
+    relation_profile = (
+        infer_required_relation_counts(
+            question=
+                question,
+
+            hop=
+                hop,
+
+            target_relation=
+                target_relation,
+        )
+    )
+
+    # ========================================================
+    # STRICT:
+    # question semantics must explain every hop
+    # ========================================================
+
+    if (
+        sum(
+            relation_profile.values()
+        )
+        != hop
+    ):
+
+        return (
+            None,
+            "relation_profile_incomplete",
+        )
+
+    # ========================================================
+    # SUPPORT PATH PER GOLD ANSWER
+    # ========================================================
+
+    support_paths_internal = {}
+
+    for gold_answer in (
+        gold_answers
+    ):
+
+        paths = find_support_paths(
+            adjacency=
+                adjacency,
+
+            question=
+                question,
+
+            topic_entity=
+                topic_entity,
+
+            gold_answer=
+                gold_answer,
+
+            hop=
+                hop,
+        )
+
+        if not paths:
+
+            return (
+                None,
+                "no_semantic_support_path",
+            )
+
+        support_paths_internal[
+            gold_answer
+        ] = paths
+
+    # ========================================================
+    # SUPPORT TRIPLES
+    # ========================================================
+
+    support_triples = (
+        collect_support_triples(
+            support_paths_internal
+        )
+    )
+
+    if not support_triples:
+
+        return (
+            None,
+            "empty_support",
+        )
+
+    # ========================================================
+    # SERIALIZE PATHS
+    # ========================================================
+
+    support_paths = {}
+
+    for answer, paths in (
+        support_paths_internal.items()
+    ):
+
+        support_paths[
+            answer
+        ] = [
+            serialize_path(
+                path
+            )
+            for path in paths
+        ]
+
+    # ========================================================
+    # CLEAN CONTEXT
+    # ========================================================
+
+    context_triples = (
+        build_context_triples(
+            item=
+                question_item,
+
+            triples=
+                triples,
+
+            adjacency=
+                adjacency,
+
+            support_paths=
+                support_paths_internal,
+
+            support_triples=
+                support_triples,
+
+            target_size=
+                context_size,
+
+            seed=
+                seed,
+        )
+    )
+
+    if (
+        len(
+            context_triples
+        )
+        != context_size
+    ):
+
+        return (
+            None,
+            "insufficient_context",
+        )
+
+    # ========================================================
+    # EVIDENCE PACKET
+    # ========================================================
+
+    evidence = []
+
+    for triple in (
+        support_triples
+    ):
+
+        evidence.append(
+            {
+                "triple":
+                    list(
+                        triple
+                    ),
+
+                "role":
+                    "support",
+            }
+        )
+
+    for triple in (
+        context_triples
+    ):
+
+        evidence.append(
+            {
+                "triple":
+                    list(
+                        triple
+                    ),
+
+                "role":
+                    "context",
+            }
+        )
+
+    # Deterministic evidence order
+    rng = random.Random(
+        stable_seed(
+            (
+                question_item[
+                    "qid"
+                ]
+                + ":evidence-order"
+            ),
+            seed,
+        )
+    )
+
+    rng.shuffle(
+        evidence
+    )
+
+    # ========================================================
+    # RELATION SIGNATURE METADATA
+    # ========================================================
+
+    signatures = {}
+
+    for answer, paths in (
+        support_paths.items()
+    ):
+
+        signatures[
+            answer
+        ] = [
+            step[
+                "relation"
+            ]
+            for step
+            in paths[0]
+        ]
+
+    output = {
+        "qid":
+            question_item[
+                "qid"
+            ],
+
+        "hop":
+            hop,
+
+        "question":
+            question,
+
+        "question_raw":
+            question_item.get(
+                "question_raw",
+                question,
+            ),
+
+        "topic_entity":
+            topic_entity,
+
+        "gold_answers":
+            gold_answers,
+
+        "target_relation":
+            target_relation,
+
+        "required_relation_counts":
+            dict(
+                relation_profile
+            ),
+
+        "relation_profile_exact":
+            True,
+
+        "selected_relation_signatures":
+            signatures,
+
+        "question_relation_scores":
+            get_question_relation_scores(
+                question
+            ),
+
+        "support_paths":
+            support_paths,
+
+        "support_triples":
+            [
+                list(
+                    triple
+                )
+                for triple
+                in support_triples
+            ],
+
+        "context_triples":
+            [
+                list(
+                    triple
+                )
+                for triple
+                in context_triples
+            ],
+
+        "evidence":
+            evidence,
+
+        "context_size":
+            context_size,
+
+        "seed":
+            seed,
+    }
+
+    return (
+        output,
+        "ok",
+    )
+
+
+# ============================================================
+# 25. VALIDATE CLEAN ITEM
+# ============================================================
+
+def validate_clean_item(item):
+    hop = item[
+        "hop"
+    ]
+
+    target_relation = (
+        item[
+            "target_relation"
+        ]
+    )
+
+    required_profile = Counter(
+        item[
+            "required_relation_counts"
+        ]
+    )
+
+    if (
+        sum(
+            required_profile.values()
+        )
+        != hop
+    ):
+
+        return (
+            False,
+            "incomplete_profile",
+        )
+
+    # ========================================================
+    # SUPPORT PATH VALIDATION
+    # ========================================================
+
+    for answer, paths in (
+        item[
+            "support_paths"
+        ].items()
+    ):
+
+        if not paths:
+
+            return (
+                False,
+                "missing_path",
+            )
+
+        path = paths[0]
+
+        if len(path) != hop:
+
+            return (
+                False,
+                "wrong_hop_count",
+            )
+
+        if (
+            path[-1][
+                "to_entity"
+            ]
+            != answer
+        ):
+
+            return (
+                False,
+                "wrong_final_entity",
+            )
+
+        if (
+            path[-1][
+                "relation"
+            ]
+            != target_relation
+        ):
+
+            return (
+                False,
+                "wrong_final_relation",
+            )
+
+        actual_profile = Counter(
+            step[
+                "relation"
+            ]
+            for step in path
+        )
+
+        if (
+            actual_profile
+            != required_profile
+        ):
+
+            return (
+                False,
+                "relation_profile_mismatch",
+            )
+
+    # ========================================================
+    # CONTEXT SIZE
+    # ========================================================
+
+    if (
+        len(
+            item[
+                "context_triples"
+            ]
+        )
+        != CONTEXT_SIZE
+    ):
+
+        return (
+            False,
+            "wrong_context_size",
+        )
+
+    # ========================================================
+    # CLEAN ANSWER-CONFLICT CHECK
+    # ========================================================
+
+    support_paths = (
+        item[
+            "support_paths"
+        ]
+    )
+
+    constraints = []
+
+    for paths in (
+        support_paths.values()
+    ):
+
+        if not paths:
+            continue
+
+        final_step = (
+            paths[0][-1]
+        )
+
+        constraints.append(
+            (
+                final_step[
+                    "from_entity"
+                ],
+                final_step[
+                    "relation"
+                ],
+                final_step[
+                    "reverse"
+                ],
+            )
+        )
+
+    for context_triple in (
+        item[
+            "context_triples"
+        ]
+    ):
+
+        head, relation, tail = (
+            context_triple
+        )
+
+        for (
+            source_entity,
+            target_relation,
+            reverse,
+        ) in constraints:
+
+            if (
+                relation
+                != target_relation
+            ):
+                continue
+
+            if (
+                not reverse
+                and head
+                == source_entity
+            ):
+
+                return (
+                    False,
+                    "competing_context_answer",
+                )
+
+            if (
+                reverse
+                and tail
+                == source_entity
+            ):
+
+                return (
+                    False,
+                    "competing_context_answer",
+                )
+
+    return (
+        True,
+        "ok",
+    )
+
+
+# ============================================================
+# 26. BUILD PILOT DATASET
+# ============================================================
+
+def build_pilot_dataset(
+    triples,
+    adjacency,
+    target_per_hop=TARGET_PER_HOP,
+    seed=DEFAULT_SEED,
+):
+    """
+    Exactly:
+        100 x 1-hop
+        100 x 2-hop
+        100 x 3-hop
+
+    Only semantically valid questions accepted.
+    """
+
+    pilot = []
+
+    all_rejections = []
+
+    for hop in (
+        1,
+        2,
+        3,
+    ):
+
+        questions = list(
+            load_questions(
+                hop
+            )
+        )
+
+        rng = random.Random(
+            stable_seed(
+                f"pilot-hop-{hop}",
+                seed,
+            )
+        )
+
+        rng.shuffle(
+            questions
+        )
+
+        accepted = []
+
+        rejection_counts = Counter()
+
+        for item in questions:
+
+            clean_item, reason = (
+                build_clean_evidence(
+                    question_item=
+                        item,
+
+                    triples=
+                        triples,
+
+                    adjacency=
+                        adjacency,
+
+                    context_size=
+                        CONTEXT_SIZE,
+
+                    seed=
+                        seed,
+                )
+            )
+
+            if clean_item is None:
+
+                rejection_counts[
+                    reason
+                ] += 1
+
+                all_rejections.append(
+                    {
+                        "qid":
+                            item[
+                                "qid"
+                            ],
+
+                        "hop":
+                            hop,
+
+                        "question":
+                            item[
+                                "question"
+                            ],
+
+                        "reason":
+                            reason,
+                    }
+                )
+
+                continue
+
+            (
+                valid,
+                validation_reason,
+            ) = validate_clean_item(
+                clean_item
+            )
+
+            if not valid:
+
+                reason = (
+                    "validation:"
+                    + validation_reason
+                )
+
+                rejection_counts[
+                    reason
+                ] += 1
+
+                all_rejections.append(
+                    {
+                        "qid":
+                            item[
+                                "qid"
+                            ],
+
+                        "hop":
+                            hop,
+
+                        "question":
+                            item[
+                                "question"
+                            ],
+
+                        "reason":
+                            reason,
+                    }
+                )
+
+                continue
+
+            accepted.append(
+                clean_item
+            )
+
+            if (
+                len(accepted)
+                >= target_per_hop
+            ):
+                break
+
+        pilot.extend(
+            accepted
+        )
+
+        print(
+            f"{hop}-hop clean items: "
+            f"{len(accepted)}/"
+            f"{target_per_hop}"
+        )
+
+        print(
+            "  Rejections:",
+            dict(
+                rejection_counts
+            ),
+        )
+
+    return (
+        pilot,
+        all_rejections,
+    )
+
+
+# ============================================================
+# 27. PRINT EXAMPLE
+# ============================================================
+
+def print_example(item):
+    print()
+    print("=" * 80)
+    print("SEMANTIC CLEAN EXAMPLE")
+    print("=" * 80)
+
+    print(
+        "QID:",
+        item[
+            "qid"
+        ],
+    )
+
+    print(
+        "Hop:",
+        item[
+            "hop"
+        ],
+    )
+
+    print(
+        "Question:",
+        item[
+            "question"
+        ],
+    )
+
+    print(
+        "Topic:",
+        item[
+            "topic_entity"
+        ],
+    )
+
+    print(
+        "Gold:",
+        item[
+            "gold_answers"
+        ],
+    )
+
+    print(
+        "Target relation:",
+        item[
+            "target_relation"
+        ],
+    )
+
+    print(
+        "Required relation profile:",
+        item[
+            "required_relation_counts"
+        ],
+    )
+
+    print()
+
+    for answer, paths in (
+        item[
+            "support_paths"
+        ].items()
+    ):
+
+        print(
+            "Answer:",
+            answer,
+        )
+
+        print(
+            "Signature:",
+            [
+                step[
+                    "relation"
+                ]
+                for step
+                in paths[0]
+            ],
+        )
+
+        for step in paths[0]:
+
+            reverse_marker = (
                 "^-1"
-                if step["reverse"]
+                if step[
+                    "reverse"
+                ]
                 else ""
             )
 
             print(
-                f"  hop={step['hop_index']} "
-                f"position={step['position']} | "
+                f"  "
                 f"{step['from_entity']} "
-                f"--[{step['relation']}"
-                f"{reverse_mark}]--> "
+                f"--["
+                f"{step['relation']}"
+                f"{reverse_marker}"
+                f"]--> "
                 f"{step['to_entity']}"
             )
 
+        print()
+
+    print(
+        "EVIDENCE:"
+    )
+
+    for entry in (
+        item[
+            "evidence"
+        ]
+    ):
+
+        triple = (
+            entry[
+                "triple"
+            ]
+        )
+
+        print(
+            f"{entry['role'].upper():8} | "
+            f"{triple[0]} | "
+            f"{triple[1]} | "
+            f"{triple[2]}"
+        )
+
 
 # ============================================================
-# 19. MAIN
+# 28. MAIN
 # ============================================================
 
 if __name__ == "__main__":
 
     # ========================================================
-    # Load KG
+    # TARGET RELATION COVERAGE
     # ========================================================
 
+    audit_target_relation_coverage()
+
+    # ========================================================
+    # LOAD KG
+    # ========================================================
+
+    print()
     print(
         "Loading KG..."
     )
 
-    triples = load_kb()
+    raw_triples = (
+        load_kb()
+    )
 
     print(
-        f"Triples: "
-        f"{len(triples)}"
+        "Raw triple example:",
+        raw_triples[0],
+    )
+
+    triples = (
+        normalize_kb_triples(
+            raw_triples
+        )
+    )
+
+    print(
+        "Triples:",
+        len(
+            triples
+        ),
+    )
+
+    print(
+        "Normalized triple example:",
+        triples[0],
     )
 
     # ========================================================
-    # Build graph index
+    # ADJACENCY
     # ========================================================
 
     print(
         "Building adjacency..."
     )
 
-    adjacency = build_adjacency(
-        triples
+    adjacency = (
+        build_adjacency(
+            triples
+        )
     )
 
     print(
-        f"Entities: "
-        f"{len(adjacency)}"
+        "Entities:",
+        len(
+            adjacency
+        ),
     )
 
+    # Catch parsing bugs immediately
+    if len(adjacency) < 1000:
+
+        raise RuntimeError(
+            "Adjacency entity count is unexpectedly small. "
+            "KG parsing/normalization is broken."
+        )
+
     # ========================================================
-    # Build pilot
+    # BUILD PILOT
     # ========================================================
 
     print()
     print(
-        "Building pilot clean evidence..."
+        "Building strict semantic-clean pilot..."
     )
     print()
 
-    pilot = build_pilot_dataset(
-        adjacency=adjacency,
-        all_triples=triples,
-        n_per_hop=100,
-        n_context=5,
-        seed=42,
+    pilot, rejections = (
+        build_pilot_dataset(
+            triples=
+                triples,
+
+            adjacency=
+                adjacency,
+
+            target_per_hop=
+                TARGET_PER_HOP,
+
+            seed=
+                DEFAULT_SEED,
+        )
     )
 
     # ========================================================
-    # Save frozen clean pilot
+    # SAVE
     # ========================================================
-
-    output_path = (
-        PROCESSED_DIR
-        / "metaqa_pilot_clean.jsonl"
-    )
 
     save_jsonl(
         pilot,
-        output_path,
+        OUTPUT_PATH,
     )
 
-    # ========================================================
-    # Summary
-    # ========================================================
+    save_jsonl(
+        rejections,
+        REJECTION_PATH,
+    )
 
     print()
+
     print(
-        f"Total pilot items: "
-        f"{len(pilot)}"
+        "Total pilot items:",
+        len(
+            pilot
+        ),
     )
 
     print(
-        f"Saved to: "
-        f"{output_path}"
+        "Saved clean pilot:",
+        OUTPUT_PATH,
     )
 
-    if not pilot:
-        raise RuntimeError(
-            "Pilot dataset is empty."
+    print(
+        "Saved rejection log:",
+        REJECTION_PATH,
+    )
+
+    # ========================================================
+    # SUMMARY
+    # ========================================================
+
+    hop_counts = {
+        1: 0,
+        2: 0,
+        3: 0,
+    }
+
+    semantic_violations = []
+
+    for item in pilot:
+
+        hop_counts[
+            item[
+                "hop"
+            ]
+        ] += 1
+
+        (
+            valid,
+            reason,
+        ) = validate_clean_item(
+            item
         )
 
-    avg_support = sum(
-        item[
-            "num_support_triples"
-        ]
-        for item in pilot
-    ) / len(pilot)
+        if not valid:
 
-    avg_context = sum(
-        item[
-            "num_context_triples"
-        ]
-        for item in pilot
-    ) / len(pilot)
+            semantic_violations.append(
+                {
+                    "qid":
+                        item[
+                            "qid"
+                        ],
+
+                    "reason":
+                        reason,
+                }
+            )
+
+    if pilot:
+
+        avg_support = (
+            sum(
+                len(
+                    item[
+                        "support_triples"
+                    ]
+                )
+                for item
+                in pilot
+            )
+            / len(pilot)
+        )
+
+        avg_context = (
+            sum(
+                len(
+                    item[
+                        "context_triples"
+                    ]
+                )
+                for item
+                in pilot
+            )
+            / len(pilot)
+        )
+
+    else:
+
+        avg_support = 0.0
+        avg_context = 0.0
 
     context_shortages = sum(
-        item[
-            "num_context_triples"
-        ] < DEFAULT_CONTEXT_SIZE
-        for item in pilot
+        1
+        for item
+        in pilot
+        if (
+            len(
+                item[
+                    "context_triples"
+                ]
+            )
+            != CONTEXT_SIZE
+        )
+    )
+
+    competing_context_violations = sum(
+        1
+        for violation
+        in semantic_violations
+        if (
+            violation[
+                "reason"
+            ]
+            == "competing_context_answer"
+        )
+    )
+
+    print()
+
+    print(
+        "Hop counts:",
+        hop_counts,
     )
 
     print(
@@ -1552,138 +3116,15 @@ if __name__ == "__main__":
     )
 
     print(
-        f"Items with <"
-        f"{DEFAULT_CONTEXT_SIZE} "
-        f"context triples: "
-        f"{context_shortages}"
-    )
-
-    # ========================================================
-    # Example
-    # ========================================================
-
-    print()
-    print(
-        "=" * 70
+        "Semantic violations:",
+        len(
+            semantic_violations
+        ),
     )
 
     print(
-        "EXAMPLE CLEAN EVIDENCE"
-    )
-
-    print(
-        "=" * 70
-    )
-
-    example = pilot[0]
-
-    print()
-
-    print(
-        "QID:",
-        example["qid"],
-    )
-
-    print(
-        "Hop:",
-        example["hop"],
-    )
-
-    print(
-        "Question:",
-        example["question"],
-    )
-
-    print(
-        "Topic:",
-        example["topic_entity"],
-    )
-
-    print(
-        "Gold answers:",
-        example["gold_answers"],
-    )
-
-    print(
-        "Target relation:",
-        example["target_relation"],
-    )
-
-    print()
-
-    print(
-        "Evidence:"
-    )
-
-    print()
-
-    for evidence_item in example[
-        "evidence"
-    ]:
-
-        triple = evidence_item[
-            "triple"
-        ]
-
-        role = evidence_item[
-            "role"
-        ]
-
-        print(
-            f"{role.upper():8} | "
-            f"{triple[0]} | "
-            f"{triple[1]} | "
-            f"{triple[2]}"
-        )
-
-    print()
-    print(
-        "Support paths:"
-    )
-    print()
-
-    for answer, paths in example[
-        "support_paths"
-    ].items():
-
-        print_support_path(
-            answer,
-            paths,
-        )
-
-        print()
-
-    # ========================================================
-    # Final sanity checks
-    # ========================================================
-
-    print(
-        "=" * 70
-    )
-
-    print(
-        "SANITY CHECKS"
-    )
-
-    print(
-        "=" * 70
-    )
-
-    hop_counts = {
-        1: 0,
-        2: 0,
-        3: 0,
-    }
-
-    for item in pilot:
-
-        hop_counts[
-            item["hop"]
-        ] += 1
-
-    print(
-        "Hop counts:",
-        hop_counts,
+        "Competing-context violations:",
+        competing_context_violations,
     )
 
     print(
@@ -1691,20 +3132,103 @@ if __name__ == "__main__":
         context_shortages,
     )
 
-    if len(pilot) == 300:
-        print(
-            "Pilot size check: PASS"
+    # ========================================================
+    # FINAL CHECKS
+    # ========================================================
+
+    pilot_ok = (
+        len(pilot) == 300
+        and hop_counts
+        == {
+            1: 100,
+            2: 100,
+            3: 100,
+        }
+    )
+
+    semantic_ok = (
+        len(
+            semantic_violations
         )
-    else:
-        print(
-            "Pilot size check: WARNING"
+        == 0
+    )
+
+    context_ok = (
+        context_shortages
+        == 0
+    )
+
+    print()
+
+    print(
+        "Pilot size check:",
+        (
+            "PASS"
+            if pilot_ok
+            else "FAIL"
+        ),
+    )
+
+    print(
+        "Semantic constraint check:",
+        (
+            "PASS"
+            if semantic_ok
+            else "FAIL"
+        ),
+    )
+
+    print(
+        "Clean answer-conflict check:",
+        (
+            "PASS"
+            if (
+                competing_context_violations
+                == 0
+            )
+            else "FAIL"
+        ),
+    )
+
+    print(
+        "Fixed context check:",
+        (
+            "PASS"
+            if context_ok
+            else "FAIL"
+        ),
+    )
+
+    # ========================================================
+    # EXAMPLE PER HOP
+    # ========================================================
+
+    for hop in (
+        1,
+        2,
+        3,
+    ):
+
+        example = next(
+            (
+                item
+                for item
+                in pilot
+                if (
+                    item[
+                        "hop"
+                    ]
+                    == hop
+                )
+            ),
+            None,
         )
 
-    if context_shortages == 0:
-        print(
-            "Fixed context check: PASS"
-        )
-    else:
-        print(
-            "Fixed context check: WARNING"
-        )
+        if (
+            example
+            is not None
+        ):
+
+            print_example(
+                example
+            )
