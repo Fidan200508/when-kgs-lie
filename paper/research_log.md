@@ -335,3 +335,26 @@ and will not be exposed to the LLM during inference.
 
 
 
+## Final clean packet validation
+
+Final clean pilot:
+- 300 questions
+- 100 / 100 / 100 for 1-hop / 2-hop / 3-hop
+
+Additional full-evidence validation was applied after semantic support-path
+construction.
+
+For every accepted clean item, all answers reachable from the complete
+evidence packet under the exact question-derived relation profile were
+required to equal the benchmark gold-answer set.
+
+Final validation:
+- base semantic failures: 0
+- full-packet answer-set failures: 0
+
+During candidate filtering, packet-level ambiguity caused rejection of:
+- 54 candidate 2-hop items
+- 15 candidate 3-hop items
+
+These items were replaced by subsequent deterministic valid samples.
+Seed: 42.

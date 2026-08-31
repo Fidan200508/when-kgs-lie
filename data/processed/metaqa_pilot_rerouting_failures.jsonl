@@ -100,3 +100,4 @@
 {"qid": "1hop_test_6505", "hop": 1, "reason": "no_intermediate_node"}
 {"qid": "3hop_test_9346", "hop": 3, "reason": "no_valid_distinct_edge_target"}
 {"qid": "3hop_test_7801", "hop": 3, "reason": "no_valid_distinct_edge_target"}
+{"qid": "3hop_test_6500", "hop": 3, "reason": "no_valid_distinct_edge_target"}

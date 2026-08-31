@@ -1,0 +1,28 @@
+{
+  "model": "Qwen/Qwen3-4B",
+  "model_short_name": "qwen3_4b",
+  "quantization": "bitsandbytes_nf4_4bit",
+  "double_quant": true,
+  "compute_dtype": "float16",
+  "thinking": false,
+  "do_sample": false,
+  "max_new_tokens": 128,
+  "prompt_version": "kgqa_evidence_only_v1",
+  "experiment_scope": "final_matched_core",
+  "expected_items_per_dataset": 28,
+  "expected_hop_counts": {
+    "2": 14,
+    "3": 14
+  },
+  "selection_constraints": {
+    "relation_substitution_feasible": true,
+    "rerouting_feasible": true,
+    "max_gold_answers": 10,
+    "max_evidence_triples": 40
+  },
+  "seed": 42,
+  "torch_version": "2.7.1+cu118",
+  "cuda_version": "11.8",
+  "gpu": "NVIDIA GeForce RTX 3050 Ti Laptop GPU",
+  "gpu_vram_gb": 4.0
+}

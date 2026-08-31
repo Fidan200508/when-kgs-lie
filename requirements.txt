@@ -1,6 +1,7 @@
 torch
-transformers
+transformers>=4.51.0,<5
 accelerate
+bitsandbytes
 pandas
 numpy
 networkx

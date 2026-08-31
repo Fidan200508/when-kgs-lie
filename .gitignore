@@ -33,3 +33,5 @@ results/raw/*
 # Temporary files
 *.log
 *.tmp
+desktop.ini
+results/*.zip

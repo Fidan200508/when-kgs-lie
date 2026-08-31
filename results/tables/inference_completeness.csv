@@ -1,0 +1,11 @@
+﻿condition,label_mode,raw_rows,unique_ok_qids,error_rows,missing_qids,extra_qids
+clean,natural,28,28,0,,
+clean,anonymized,28,28,0,,
+entity_substitution,natural,28,28,0,,
+entity_substitution,anonymized,28,28,0,,
+relation_substitution,natural,28,28,0,,
+relation_substitution,anonymized,28,28,0,,
+contradiction,natural,28,28,0,,
+contradiction,anonymized,28,28,0,,
+rerouting,natural,28,28,0,,
+rerouting,anonymized,28,28,0,,
